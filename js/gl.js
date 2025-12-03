@@ -1458,6 +1458,9 @@ var importObject = {
             }
             animation_frame_timeout = window.requestAnimationFrame(animation);
         },
+        cancel_animation_frame: function (id) {
+            window.cancelAnimationFrame(id);
+        },
         init_webgl
     }
 };
