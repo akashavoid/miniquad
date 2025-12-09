@@ -1221,7 +1221,42 @@ function createMacroquadContext(canvas) {
                   var btn = into_sapp_mousebutton(event.button);
                   wasm_exports.mouse_up(x, y, btn);
               };
-              canvas.onkeydown = function (event) {
+              // Helper to check if user is typing in an input element
+              // Covers: standard form inputs, contentEditable, ARIA textboxes
+              function isTypingInInput() {
+                  var el = document.activeElement;
+                  if (!el) return false;
+
+                  var tag = el.tagName;
+
+                  // Standard form inputs
+                  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+                      return true;
+                  }
+
+                  // ContentEditable elements (rich text editors)
+                  if (el.isContentEditable) {
+                      return true;
+                  }
+
+                  // ARIA textbox role (accessibility)
+                  if (el.getAttribute && el.getAttribute('role') === 'textbox') {
+                      return true;
+                  }
+
+                  return false;
+              }
+
+              // Store listener references for SPA cleanup
+              var _keydownListener, _keyupListener, _keypressListener;
+
+              // Document-level keyboard listeners (receive events regardless of canvas focus)
+              _keydownListener = function (event) {
+                  // Skip if WASM not loaded or user is typing in an input element
+                  if (!wasm_exports || isTypingInInput()) {
+                      return;
+                  }
+
                   var sapp_key_code = into_sapp_keycode(event.code);
                   switch (sapp_key_code) {
                       //  space, arrows - prevent scrolling of the page
@@ -1237,7 +1272,7 @@ function createMacroquadContext(canvas) {
                           event.preventDefault();
                           break;
                   }
-  
+
                   var modifiers = 0;
                   if (event.ctrlKey) {
                       modifiers |= SAPP_MODIFIER_CTRL;
@@ -1255,9 +1290,16 @@ function createMacroquadContext(canvas) {
                       wasm_exports.key_press(sapp_key_code);
                   }
               };
-              canvas.onkeyup = function (event) {
+              document.addEventListener('keydown', _keydownListener);
+
+              _keyupListener = function (event) {
+                  // Skip if WASM not loaded or user is typing in an input element
+                  if (!wasm_exports || isTypingInInput()) {
+                      return;
+                  }
+
                   var sapp_key_code = into_sapp_keycode(event.code);
-  
+
                   var modifiers = 0;
                   if (event.ctrlKey) {
                       modifiers |= SAPP_MODIFIER_CTRL;
@@ -1268,18 +1310,34 @@ function createMacroquadContext(canvas) {
                   if (event.altKey) {
                       modifiers |= SAPP_MODIFIER_ALT;
                   }
-  
+
                   wasm_exports.key_up(sapp_key_code, modifiers);
               };
-              canvas.onkeypress = function (event) {
+              document.addEventListener('keyup', _keyupListener);
+
+              _keypressListener = function (event) {
+                  // Skip if WASM not loaded or user is typing in an input element
+                  if (!wasm_exports || isTypingInInput()) {
+                      return;
+                  }
+
                   var sapp_key_code = into_sapp_keycode(event.code);
-  
+
                   // firefox do not send onkeypress events for ctrl+keys and delete key while chrome do
                   // workaround to make this behavior consistent
                   let chrome_only = sapp_key_code == 261 || event.ctrlKey;
                   if (chrome_only == false) {
                       wasm_exports.key_press(event.charCode);
                   }
+              };
+              document.addEventListener('keypress', _keypressListener);
+
+              // Cleanup function for SPA unmount (prevents memory leaks)
+              window.cleanupMiniquadKeyboardListeners = function() {
+                  if (_keydownListener) document.removeEventListener('keydown', _keydownListener);
+                  if (_keyupListener) document.removeEventListener('keyup', _keyupListener);
+                  if (_keypressListener) document.removeEventListener('keypress', _keypressListener);
+                  _keydownListener = _keyupListener = _keypressListener = null;
               };
   
               canvas.addEventListener("touchstart", function (event) {
