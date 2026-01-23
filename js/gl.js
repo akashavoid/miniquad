@@ -657,7 +657,9 @@ function createMacroquadContext(canvas) {
               return Math.floor(Math.random() * 2147483647);
           },
           now: function () {
-              return Date.now() / 1000.0;
+              // Use performance.now() for monotonic time (never jumps backward)
+              // Returns milliseconds since page load, convert to seconds
+              return performance.now() / 1000.0;
           },
           canvas_width: function () {
               return Math.floor(canvas.width);
