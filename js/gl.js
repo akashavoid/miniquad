@@ -1376,7 +1376,11 @@ function createMacroquadContext(canvas) {
               });
   
               window.onresize = function () {
-                  resize(canvas, wasm_exports.resize);
+                  // Null-check prevents crash when WASM not loaded or context lost
+                  // Fixes AKASHA-FRONTEND-1: "can't access property 'resize', wasm_exports is null"
+                  if (wasm_exports && wasm_exports.resize) {
+                      resize(canvas, wasm_exports.resize);
+                  }
               };
               window.addEventListener("copy", function (e) {
                   if (clipboard != null) {
