@@ -5,6 +5,7 @@ mod keycodes;
 
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     path::PathBuf,
     sync::{mpsc::Receiver, Mutex, OnceLock},
     thread_local,
@@ -13,6 +14,7 @@ use std::{
 use crate::{
     event::EventHandler,
     native::{NativeDisplayData, Request},
+    KeyCode, KeyMods, MouseButton, TouchPhase,
 };
 
 // fn dropped_file_count(&mut self) -> usize {
@@ -25,16 +27,127 @@ use crate::{
 //     self.dropped_files.paths.get(index).cloned()
 // }
 
+/// Events that may be deferred if EVENT_HANDLER is already borrowed.
+///
+/// Browser events (touch, mouse, keyboard) can fire during frame execution,
+/// causing RefCell re-entrancy panics. When this happens, events are queued
+/// and processed at the start of the next frame.
+#[derive(Debug, Clone)]
+enum DeferredEvent {
+    Touch { phase: TouchPhase, id: u64, x: f32, y: f32 },
+    MouseMove { x: f32, y: f32 },
+    RawMouseMove { dx: f32, dy: f32 },
+    MouseDown { btn: MouseButton, x: f32, y: f32 },
+    MouseUp { btn: MouseButton, x: f32, y: f32 },
+    MouseWheel { dx: f32, dy: f32 },
+    KeyDown { key: KeyCode, mods: KeyMods, repeat: bool },
+    KeyUp { key: KeyCode, mods: KeyMods },
+    CharEvent { character: char, mods: KeyMods, repeat: bool },
+    Resize { width: f32, height: f32 },
+    Focus { has_focus: bool },
+    FilesDropped,
+}
+
 thread_local! {
     static EVENT_HANDLER: RefCell<Option<Box<dyn EventHandler>>> = RefCell::new(None);
     static REQUESTS: RefCell<Option<Receiver<Request>>> = const { RefCell::new(None) };
+    /// Queue for events that couldn't be delivered due to RefCell borrow conflict.
+    /// Drained at the start of each frame before update/draw.
+    static DEFERRED_EVENTS: RefCell<VecDeque<DeferredEvent>> = const { RefCell::new(VecDeque::new()) };
 }
+
 fn tl_event_handler<T, F: FnOnce(&mut dyn EventHandler) -> T>(f: F) -> T {
     EVENT_HANDLER.with(|globals| {
         let mut globals = globals.borrow_mut();
         let globals: &mut Box<dyn EventHandler> = globals.as_mut().unwrap();
         f(&mut **globals)
     })
+}
+
+/// Try to execute event handler immediately, or defer if already borrowed.
+///
+/// Returns true if executed immediately, false if deferred.
+fn try_event_handler_or_defer<F>(event: DeferredEvent, f: F) -> bool
+where
+    F: FnOnce(&mut dyn EventHandler),
+{
+    EVENT_HANDLER.with(|globals| {
+        match globals.try_borrow_mut() {
+            Ok(mut guard) => {
+                if let Some(handler) = guard.as_mut() {
+                    f(&mut **handler);
+                }
+                true
+            }
+            Err(_) => {
+                // RefCell already borrowed (re-entrancy during frame execution)
+                // Queue the event for processing at start of next frame
+                DEFERRED_EVENTS.with(|q| {
+                    q.borrow_mut().push_back(event);
+                });
+                false
+            }
+        }
+    })
+}
+
+/// Process all deferred events. Called at the start of each frame.
+fn drain_deferred_events() {
+    let events: Vec<DeferredEvent> = DEFERRED_EVENTS.with(|q| {
+        q.borrow_mut().drain(..).collect()
+    });
+
+    for event in events {
+        tl_event_handler(|handler| {
+            dispatch_deferred_event(handler, event);
+        });
+    }
+}
+
+/// Dispatch a deferred event to the event handler.
+fn dispatch_deferred_event(handler: &mut dyn EventHandler, event: DeferredEvent) {
+    match event {
+        DeferredEvent::Touch { phase, id, x, y } => {
+            handler.touch_event(phase, id, x, y);
+        }
+        DeferredEvent::MouseMove { x, y } => {
+            handler.mouse_motion_event(x, y);
+        }
+        DeferredEvent::RawMouseMove { dx, dy } => {
+            handler.raw_mouse_motion(dx, dy);
+        }
+        DeferredEvent::MouseDown { btn, x, y } => {
+            handler.mouse_button_down_event(btn, x, y);
+        }
+        DeferredEvent::MouseUp { btn, x, y } => {
+            handler.mouse_button_up_event(btn, x, y);
+        }
+        DeferredEvent::MouseWheel { dx, dy } => {
+            handler.mouse_wheel_event(dx, dy);
+        }
+        DeferredEvent::KeyDown { key, mods, repeat } => {
+            handler.key_down_event(key, mods, repeat);
+        }
+        DeferredEvent::KeyUp { key, mods } => {
+            handler.key_up_event(key, mods);
+        }
+        DeferredEvent::CharEvent { character, mods, repeat } => {
+            handler.char_event(character, mods, repeat);
+        }
+        DeferredEvent::Resize { width, height } => {
+            handler.resize_event(width, height);
+        }
+        DeferredEvent::Focus { has_focus } => {
+            if has_focus {
+                handler.window_restored_event();
+            } else {
+                handler.window_minimized_event();
+            }
+        }
+        DeferredEvent::FilesDropped => {
+            handler.files_dropped_event();
+        }
+    }
 }
 
 static mut CURSOR_ICON: crate::CursorIcon = crate::CursorIcon::Default;
@@ -220,6 +333,10 @@ pub extern "C" fn on_clipboard_paste(msg: *mut u8, len: usize) {
 
 #[no_mangle]
 pub extern "C" fn frame() {
+    // Process any events that were deferred due to RefCell borrow conflicts
+    // (e.g., touch events that fired during the previous frame's update/draw)
+    drain_deferred_events();
+
     REQUESTS.with(|r| {
         while let Ok(request) = r.borrow_mut().as_mut().unwrap().try_recv() {
             match request {
@@ -243,59 +360,69 @@ pub extern "C" fn frame() {
 
 #[no_mangle]
 pub extern "C" fn mouse_move(x: i32, y: i32) {
-    tl_event_handler(|event_handler| {
-        event_handler.mouse_motion_event(x as _, y as _);
-    });
+    let (x, y) = (x as f32, y as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::MouseMove { x, y },
+        |handler| handler.mouse_motion_event(x, y),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn raw_mouse_move(dx: i32, dy: i32) {
-    tl_event_handler(|event_handler| {
-        event_handler.raw_mouse_motion(dx as _, dy as _);
-    });
+    let (dx, dy) = (dx as f32, dy as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::RawMouseMove { dx, dy },
+        |handler| handler.raw_mouse_motion(dx, dy),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn mouse_down(x: i32, y: i32, btn: i32) {
     let btn = keycodes::translate_mouse_button(btn);
-
-    tl_event_handler(|event_handler| {
-        event_handler.mouse_button_down_event(btn, x as _, y as _);
-    });
+    let (x, y) = (x as f32, y as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::MouseDown { btn, x, y },
+        |handler| handler.mouse_button_down_event(btn, x, y),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn mouse_up(x: i32, y: i32, btn: i32) {
     let btn = keycodes::translate_mouse_button(btn);
-
-    tl_event_handler(|event_handler| {
-        event_handler.mouse_button_up_event(btn, x as _, y as _);
-    });
+    let (x, y) = (x as f32, y as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::MouseUp { btn, x, y },
+        |handler| handler.mouse_button_up_event(btn, x, y),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn mouse_wheel(dx: i32, dy: i32) {
-    tl_event_handler(|event_handler| {
-        event_handler.mouse_wheel_event(dx as _, dy as _);
-    });
+    let (dx, dy) = (dx as f32, dy as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::MouseWheel { dx, dy },
+        |handler| handler.mouse_wheel_event(dx, dy),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn key_down(key: u32, modifiers: u32, repeat: bool) {
     let key = keycodes::translate_keycode(key as _);
     let mods = keycodes::translate_mod(modifiers as _);
-
-    tl_event_handler(|event_handler| {
-        event_handler.key_down_event(key, mods, repeat);
-    });
+    try_event_handler_or_defer(
+        DeferredEvent::KeyDown { key, mods, repeat },
+        |handler| handler.key_down_event(key, mods, repeat),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn key_press(key: u32) {
-    if let Some(key) = char::from_u32(key) {
-        tl_event_handler(|event_handler| {
-            event_handler.char_event(key, crate::KeyMods::default(), false);
-        });
+    if let Some(character) = char::from_u32(key) {
+        let mods = crate::KeyMods::default();
+        try_event_handler_or_defer(
+            DeferredEvent::CharEvent { character, mods, repeat: false },
+            |handler| handler.char_event(character, mods, false),
+        );
     }
 }
 
@@ -303,41 +430,49 @@ pub extern "C" fn key_press(key: u32) {
 pub extern "C" fn key_up(key: u32, modifiers: u32) {
     let key = keycodes::translate_keycode(key as _);
     let mods = keycodes::translate_mod(modifiers as _);
-
-    tl_event_handler(|event_handler| {
-        event_handler.key_up_event(key, mods);
-    });
+    try_event_handler_or_defer(
+        DeferredEvent::KeyUp { key, mods },
+        |handler| handler.key_up_event(key, mods),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn resize(width: i32, height: i32) {
+    // Update display dimensions immediately (not deferred)
     {
         let mut d = crate::native_display().lock().unwrap();
         d.screen_width = width as _;
         d.screen_height = height as _;
     }
-    tl_event_handler(|event_handler| {
-        event_handler.resize_event(width as _, height as _);
-    });
+    let (width, height) = (width as f32, height as f32);
+    try_event_handler_or_defer(
+        DeferredEvent::Resize { width, height },
+        |handler| handler.resize_event(width, height),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn touch(phase: u32, id: u32, x: f32, y: f32) {
     let phase = keycodes::translate_touch_phase(phase as _);
-    tl_event_handler(|event_handler| {
-        event_handler.touch_event(phase, id as _, x as _, y as _);
-    });
+    let id = id as u64;
+    try_event_handler_or_defer(
+        DeferredEvent::Touch { phase, id, x, y },
+        |handler| handler.touch_event(phase, id, x, y),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn focus(has_focus: bool) {
-    tl_event_handler(|event_handler| {
-        if has_focus {
-            event_handler.window_restored_event();
-        } else {
-            event_handler.window_minimized_event();
-        }
-    });
+    try_event_handler_or_defer(
+        DeferredEvent::Focus { has_focus },
+        |handler| {
+            if has_focus {
+                handler.window_restored_event();
+            } else {
+                handler.window_minimized_event();
+            }
+        },
+    );
 }
 
 #[no_mangle]
@@ -348,7 +483,10 @@ pub extern "C" fn on_files_dropped_start() {
 
 #[no_mangle]
 pub extern "C" fn on_files_dropped_finish() {
-    tl_event_handler(|event_handler| event_handler.files_dropped_event());
+    try_event_handler_or_defer(
+        DeferredEvent::FilesDropped,
+        |handler| handler.files_dropped_event(),
+    );
 }
 
 #[no_mangle]
